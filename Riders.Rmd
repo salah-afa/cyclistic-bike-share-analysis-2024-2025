@@ -1,0 +1,248 @@
+---
+title: "Riders"
+output: html_document
+author: "Salah Afaghani"
+date: "2026-02-19"
+---
+
+# Study Riders
+
+## Introduction
+
+Welcome to my Google Data Analytics Capstone project! In this case study, I am assuming the role of a Junior Data Analyst working on the marketing analyst team at **Cyclistic**, a fictional bike-share company based in Chicago.
+
+### The Business Task
+
+Cyclistic's finance analysts have concluded that annual members are much more profitable than casual riders. The Director of Marketing believes the company’s future success depends on maximizing the number of annual memberships.
+
+My team's goal is to design a new marketing strategy to convert casual riders into annual members. To do that, we must first understand the behavioral differences between these two customer segments. The primary business question I am answering in this report is: **How do annual members and casual riders use Cyclistic bikes differently?**
+
+### The Data Source
+
+To answer this question, I am analyzing Cyclistic's historical trip data. Specifically, I am focusing on a comparative analysis of the fourth quarter (October, November, December) across two years: 2024 and 2025.
+
+*Note: The data used for this case study is public bicycle-sharing data from Divvy. The Divvy system is owned by the City of Chicago and operated by Lyft Bikes and Scooters, LLC. The data has been made available under a [public data license agreement](https://divvybikes.com/data-license-agreement) and can be downloaded directly from the [Divvy Data portal](https://divvy-tripdata.s3.amazonaws.com/index.html). All personally identifiable information has been removed to ensure rider privacy.*
+
+## Install & Load libraries
+
+```{r setup, warning=FALSE, message=FALSE}
+# install.packages("tidyverse")
+# install.packages("skimr")
+# install.packages("readr")
+library(tidyverse)
+library(skimr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+library(scales)
+```
+
+## Read CSV files into variables
+
+```{r, message=FALSE, warning=FALSE}
+riders_202410 <- read_csv("202410-divvy-tripdata.csv")
+riders_202411 <- read_csv("202411-divvy-tripdata.csv")
+riders_202412 <- read_csv("202412-divvy-tripdata.csv")
+riders_202510 <- read_csv("202510-divvy-tripdata.csv")
+riders_202511 <- read_csv("202511-divvy-tripdata.csv")
+riders_202512 <- read_csv("202512-divvy-tripdata.csv")
+```
+
+## Cleaning Steps
+
+Combine all data frames and do basics cleaning.
+
+```{r}
+data_list <- list(riders_202410, riders_202411, riders_202412, riders_202510, riders_202511, riders_202512)
+
+# A container to store our cleaning stats
+cleaning_summary <- data.frame()
+
+process_and_track <- function(df, df_name) {
+  # 0. Initial Count
+  initial_count <- nrow(df)
+  
+  # 1. Typecasting and Strings (doesn't change row count)
+  df_clean <- df %>%
+    mutate(
+      started_at = as.POSIXct(started_at),
+      ended_at = as.POSIXct(ended_at),
+      across(where(is.character), ~str_squish(str_trim(.))),
+      ride_length = as.numeric(difftime(ended_at, started_at, units = "secs")),
+      weekday = wday(started_at, label = TRUE, abbr = FALSE)
+    )
+  
+  # 2. Track Business Logic Drops
+  # We filter step-by-step to see exactly where data is lost
+  too_short <- df_clean %>% filter(ride_length <= 60) %>% nrow()
+  too_long  <- df_clean %>% filter(ride_length >= 86400) %>% nrow()
+  no_move   <- df_clean %>% filter(start_lat == end_lat & start_lng == end_lng) %>% nrow()
+  gps_error <- df_clean %>% filter(is.na(end_lat) | end_lat <= 40 | end_lat >= 45) %>% nrow()
+  
+  # 3. Apply the final filter
+  df_final <- df_clean %>%
+    filter(
+      ride_length > 60,
+      ride_length < 86400,
+      start_lat != end_lat | start_lng != end_lng,
+      !is.na(end_lat), # Handle NAs first to avoid filter issues
+      end_lat > 40 & end_lat < 45,
+      end_lng > -90 & end_lng < -80
+    ) %>%
+    mutate(
+      start_station_name = replace_na(start_station_name, "On-Street / GPS Check-in"),
+      end_station_name = replace_na(end_station_name, "On-Street / GPS Check-in")
+    )
+
+  # 4. Save results to the summary table
+  stats <- data.frame(
+    dataset = df_name,
+    original = initial_count,
+    lost_too_short = too_short,
+    lost_too_long = too_long,
+    lost_no_movement = no_move,
+    lost_gps_outliers = gps_error,
+    final = nrow(df_final)
+  )
+  
+  # Use global assignment to update the summary table
+  cleaning_summary <<- bind_rows(cleaning_summary, stats)
+  
+  return(df_final)
+}
+
+# Apply the tracker (assuming your dataframes are in a named list)
+data_names <- c("2024_10", "2024_11", "2024_12", "2025_10", "2025_11", "2025_12")
+cleaned_list <- map2(data_list, data_names, process_and_track)
+
+# Final step: Duplicates (Tracked separately after merge)
+all_rides_combined <- bind_rows(cleaned_list)
+total_before_dup <- nrow(all_rides_combined)
+all_rides_final <- all_rides_combined %>% distinct(ride_id, .keep_all = TRUE)
+total_after_dup <- nrow(all_rides_final)
+
+# View the cleaning report
+print(cleaning_summary)
+cat("Rows lost to duplicates:", total_before_dup - total_after_dup)
+```
+
+Then Order the weekday so it plots properly from Sunday to Saturday
+
+```{r}
+all_rides_final <- all_rides_final %>%
+  mutate(weekday = factor(weekday, 
+                          levels = c("Sunday", "Monday", "Tuesday", 
+                                     "Wednesday", "Thursday", "Friday", "Saturday")))
+```
+
+## Descriptive Analysis (Overall Stats)
+
+```{r}
+overall_stats <- all_rides_final %>%
+  summarize(
+    avg_ride_length_secs = mean(ride_length),
+    avg_ride_length_mins = mean(ride_length) / 60, # Easier for business stakeholders to read
+    max_ride_length_hrs = max(ride_length) / 3600,
+    most_common_day = names(which.max(table(weekday)))
+  )
+
+print(overall_stats)
+```
+
+## Create the Aggregations dataframes
+
+```{r}
+# 1. Compare average ride length and total rides by user type
+user_type_summary <- all_rides_final %>%
+  group_by(member_casual) %>%
+  summarize(
+    total_rides = n(),
+    avg_ride_length_mins = mean(ride_length) / 60
+  )
+print(user_type_summary)
+
+# 2. Compare average ride length and total rides by user type AND day of the week
+weekly_summary <- all_rides_final %>%
+  group_by(member_casual, weekday) %>%
+  summarize(
+    number_of_rides = n(),
+    avg_ride_length_mins = mean(ride_length) / 60,
+    .groups = 'drop' # Cleans up the grouping for future steps
+  ) %>%
+  arrange(member_casual, weekday)
+
+print(weekly_summary)
+```
+
+## Export Summary Files for Deliverables
+
+```{r}
+# Export the clean, aggregated weekly summary
+write_csv(weekly_summary, "cyclistic_weekly_summary.csv")
+
+# Export the entire cleaned dataset
+write_csv(all_rides_final, "cyclistic_all_cleaned_rides.csv")
+```
+
+## Visualization
+
+### 1: Total Rides by Day and User Type
+
+The Goal: Visualize the volume difference. Who rides more, and when? The Story it Tells: This chart usually reveals the "Commuter vs. Leisure" pattern. Expect members to dominate weekdays and casual riders to surge on weekends.
+
+```{r}
+# Define custom professional colors (optional, but recommended)
+cyclistic_colors <- c("casual" = "#E69F00", "member" = "#56B4E9") # Orange and Blue
+
+ggplot(data = weekly_summary, aes(x = weekday, y = number_of_rides, fill = member_casual)) +
+  # geom_col creates bar charts for pre-summarized data. 
+  # position = "dodge" places the bars side-by-side instead of stacked.
+  geom_col(position = "dodge") +
+  
+  # Adding professional labels and titles
+  labs(title = "Cyclistic: Total Rides by Day of Week",
+       subtitle = "Comparison of usage volume between Casual Riders and Annual Members",
+       x = "", # Removing x-label because days of week are obvious
+       y = "Number of Rides",
+       fill = "User Type") +
+  
+  # Formatting the y-axis to have commas for thousands (e.g., 50,000)
+  scale_y_continuous(labels = comma) +
+  
+  # Applying custom colors
+  scale_fill_manual(values = cyclistic_colors) +
+  
+  # Using a clean, minimalist theme standard for business presentations
+  theme_minimal() +
+  
+  # Slight adjustments for better readability
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), # Tilts text if it overlaps
+        plot.title = element_text(face = "bold", size = 16),
+        legend.position = "top") # Moves legend to top to save space
+```
+
+### 2: Average Ride Duration by Day and User Type
+
+The Goal: Visualize behavior. Are they commuting (short trips) or exploring (long trips)? The Story it Tells: This is usually the most striking chart. Casual riders almost always take significantly longer trips than members, regardless of the day.
+
+```{r}
+ggplot(data = weekly_summary, aes(x = weekday, y = avg_ride_length_mins, fill = member_casual)) +
+  geom_col(position = "dodge") +
+  
+  labs(title = "Cyclistic: Average Ride Duration by Day of Week",
+       subtitle = "Members take shorter, consistent trips; Casual riders take longer, leisurely trips",
+       x = "",
+       y = "Average Trip Duration (Minutes)",
+       fill = "User Type") +
+  
+  # No need for comma scale here as minutes usually stay under 60
+  scale_fill_manual(values = cyclistic_colors) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(face = "bold", size = 16),
+        legend.position = "top")
+```
+
+## The Final Recommendation:
+
+To convert casual riders into members, a standard 'commuter' membership won't appeal to them. We need marketing that targets their desire for longer, weekend leisure rides—perhaps offering a 'Weekend warrior' annual pass or highlighting how a membership makes those long weekend rides cheaper.
